@@ -26,6 +26,7 @@
 (define-constant ERR-SLIPPAGE-EXCEEDED (err u108))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u109))
 (define-constant ERR-MINIMUM-STAKE-NOT-MET (err u110))
+(define-constant ERR-NO-YIELD (err u111))
 
 ;; Access control helper functions
 (define-private (is-contract-owner)
@@ -181,7 +182,8 @@
     (asserts! (check-not-paused) ERR-CONTRACT-PAUSED)
     (asserts! (> share-amount u0) ERR-INVALID-AMOUNT)
     
-    (let ((user-shares (default-to u0 (map-get? shares tx-sender)))
+    (let ((caller tx-sender)
+          (user-shares (default-to u0 (map-get? shares tx-sender)))
           (current-total-staked (var-get total-staked))
           (current-total-shares (var-get total-shares)))
       
@@ -202,7 +204,7 @@
         (var-set total-staked (- current-total-staked amount))
         
         ;; FIXED: Transfer STX from contract to user (corrected the transfer direction)
-        (match (as-contract (stx-transfer? amount tx-sender tx-sender))
+        (match (as-contract (stx-transfer? amount tx-sender caller))
           success (ok amount)
           error (begin
             ;; Rollback state changes on transfer failure
@@ -218,7 +220,8 @@
     (asserts! (check-not-paused) ERR-CONTRACT-PAUSED)
     (asserts! (> share-amount u0) ERR-INVALID-AMOUNT)
     
-    (let ((user-shares (default-to u0 (map-get? shares tx-sender)))
+    (let ((caller tx-sender)
+          (user-shares (default-to u0 (map-get? shares tx-sender)))
           (current-total-staked (var-get total-staked))
           (current-total-shares (var-get total-shares)))
       
@@ -241,7 +244,7 @@
         (var-set total-staked (- current-total-staked amount))
         
         ;; Transfer STX from contract to user
-        (match (as-contract (stx-transfer? amount tx-sender tx-sender))
+        (match (as-contract (stx-transfer? amount tx-sender caller))
           success (ok amount)
           error (begin
             ;; Rollback state changes on transfer failure
@@ -249,6 +252,34 @@
             (var-set total-shares current-total-shares)
             (var-set total-staked current-total-staked)
             ERR-TRANSFER-FAILED))))))
+
+;; Synchronize the internal accounting with the on-chain balance and optionally mint shares
+(define-public (sync-balance (beneficiary (optional principal)))
+  (begin
+    (asserts! (check-not-paused) ERR-CONTRACT-PAUSED)
+    (asserts! (is-authorized-operator) ERR-NOT-AUTHORIZED)
+    (let (
+          (old-total-staked (var-get total-staked))
+          (old-total-shares (var-get total-shares))
+          (actual-balance (stx-get-balance (as-contract tx-sender))))
+      (let ((delta (if (> actual-balance old-total-staked)
+                       (- actual-balance old-total-staked)
+                       u0)))
+        (asserts! (> delta u0) ERR-NO-YIELD)
+        (var-set total-staked (+ old-total-staked delta))
+        (match beneficiary mint-beneficiary
+          (let ((minted (if (is-eq old-total-shares u0)
+                            delta
+                            (begin
+                              (asserts! (> old-total-staked u0) ERR-CALCULATION-ERROR)
+                              (/ (* delta old-total-shares) old-total-staked)))))
+            (if (> minted u0)
+                (begin
+                  (map-set shares mint-beneficiary (+ (default-to u0 (map-get? shares mint-beneficiary)) minted))
+                  (var-set total-shares (+ old-total-shares minted))
+                  (ok { added-staked: delta, minted-shares: minted }))
+                (ok { added-staked: delta, minted-shares: u0 })))
+          (ok { added-staked: delta, minted-shares: u0 })))))) 
 
 ;; Emergency function to recover stuck funds (only owner, only when paused)
 (define-public (emergency-withdraw (amount uint) (recipient principal))
